@@ -1,0 +1,6 @@
+# Local test output / client-specific artifacts - never commit client data
+*.html
+*.csv
+*.log
+gpresult*
+.vscode/
