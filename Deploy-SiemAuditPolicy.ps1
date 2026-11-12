@@ -13,9 +13,9 @@
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [ValidateSet('', 'Full', 'Domain', 'SysmonDomain', 'AdAudit', 'Local', 'SysmonLocal', 'Verify', 'Show', 'Manual', 'Help')]
+    [ValidateSet('', 'Full', 'Domain', 'SysmonDomain', 'AdAudit', 'Local', 'LocalAll', 'SysmonLocal', 'Verify', 'Show', 'Manual', 'Help')]
     [string]$Mode = '',
-    [ValidateSet('All', 'Workstations', 'Servers', 'DomainControllers')]
+    # All|Workstations|Servers|DomainControllers; "Workstations,Servers" also accepted (RMM / -File).
     [string[]]$Target = @('All'),
     [ValidateSet('Auto', 'Workstation', 'Server', 'DomainController')]
     [string]$Role = 'Auto',
@@ -35,12 +35,56 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$PolicyVersion = '1.2.0'
+# RMM agents (e.g. Kaseya) may start 32-bit PowerShell, where System32 and dism point at
+# the 32-bit view. Re-run in 64-bit Windows PowerShell with the same parameters.
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess -and $MyInvocation.InvocationName -ne '.') {
+    $ps64 = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    if ($PSCommandPath -and (Test-Path $ps64)) {
+        $relaunch = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+        foreach ($k in @($PSBoundParameters.Keys)) {
+            $v = $PSBoundParameters[$k]
+            if ($v -is [System.Management.Automation.SwitchParameter]) { if ($v.IsPresent) { $relaunch += "-$k" } }
+            elseif ("$(@($v) -join ',')" -ne '') { $relaunch += "-$k"; $relaunch += (@($v) -join ',') }
+        }
+        Write-Host 'Started in 32-bit PowerShell; re-running in 64-bit PowerShell.'
+        & $ps64 @relaunch
+        exit $LASTEXITCODE
+    }
+    Write-Warning 'Running in 32-bit PowerShell on 64-bit Windows; Sysmon steps may fail. Run the script from 64-bit PowerShell.'
+}
+
+# RMM script variables (e.g. NinjaOne) arrive as environment variables SIEM_<PARAMETER>,
+# e.g. SIEM_MODE=LocalAll, SIEM_ACCEPTEULA=true. A command-line parameter always wins.
+$envSet = @{}
+foreach ($pair in @(@('Mode', 'MODE'), @('Target', 'TARGET'), @('Role', 'ROLE'), @('GpoPrefix', 'GPOPREFIX'), @('Server', 'SERVER'),
+        @('SysmonZip', 'SYSMONZIP'), @('SysmonConfig', 'SYSMONCONFIG'), @('SysmonConfig', 'SYSMONCONFIGURL'), @('SysmonExisting', 'SYSMONEXISTING'))) {
+    $ev = [Environment]::GetEnvironmentVariable("SIEM_$($pair[1])")
+    if ([string]::IsNullOrWhiteSpace($ev) -or $PSBoundParameters.ContainsKey($pair[0]) -or $envSet.ContainsKey($pair[0])) { continue }
+    try { Set-Variable -Name $pair[0] -Value $ev.Trim() } catch { throw "Environment variable SIEM_$($pair[1]) has an invalid value: '$ev'" }
+    $envSet[$pair[0]] = $true
+}
+foreach ($n in @('AcceptEula', 'Force', 'NoLink')) {
+    $ev = [Environment]::GetEnvironmentVariable("SIEM_$($n.ToUpper())")
+    if (-not $PSBoundParameters.ContainsKey($n) -and "$ev".Trim() -match '^(1|true|yes|y|on)$') { Set-Variable -Name $n -Value ([switch]$true) }
+}
+
+# Normalize -Target: accept arrays, "a,b" strings and any letter case.
+$ValidTargets = @('All', 'Workstations', 'Servers', 'DomainControllers')
+$Target = @($Target | ForEach-Object { "$_" -split '[,;\s]+' } | Where-Object { $_ } | ForEach-Object {
+        $t = $_; $hit = @($ValidTargets | Where-Object { $_ -eq $t })
+        if ($hit.Count -eq 0) { throw "Invalid -Target '$t'. Use: $($ValidTargets -join ', ')" }
+        $hit[0]
+    } | Select-Object -Unique)
+if ($Target.Count -eq 0) { $Target = @('All') }
+
+$PolicyVersion = '1.3.0'
 $script:DryRun = [bool]$WhatIfPreference
+if ("$([Environment]::GetEnvironmentVariable('SIEM_WHATIF'))".Trim() -match '^(1|true|yes|y|on)$') { $script:DryRun = $true }
+$script:ExitCode = 0               # 0 OK, 1 steps need manual completion / bad invocation, 2 Verify found failures
 $script:Interactive = $false       # true when the menu is used (prompts allowed)
 $script:Failed = New-Object System.Collections.Generic.List[string]
 $script:DomainCtx = $null
-$script:SysmonConfigGiven = $PSBoundParameters.ContainsKey('SysmonConfig')
+$script:SysmonConfigGiven = $PSBoundParameters.ContainsKey('SysmonConfig') -or $envSet.ContainsKey('SysmonConfig')
 $script:SysmonConfigSource = $null
 $script:SysmonExistingAnswer = $null
 $script:AcceptEulaAnswered = $false
@@ -384,6 +428,7 @@ SIEM Audit Policy v$PolicyVersion - run in an elevated PowerShell. No parameters
   This computer                                                [-Role ...]
     Local         Apply audit settings (+ remove PowerShell 2.0 engine)
     SysmonLocal   Install Sysmon now (built-in first, installer fallback)
+    LocalAll      Local + SysmonLocal (workgroup / RMM)
     Verify        Check logging, read-only
     Show          List settings, read-only
     Manual        Print manual steps for everything, no changes
@@ -397,6 +442,10 @@ SIEM Audit Policy v$PolicyVersion - run in an elevated PowerShell. No parameters
     -AcceptEula   Accept Sysinternals license (installer fallback)
     -WhatIf       Preview only       -Force   Answer yes to prompts
     -NoLink       Create GPOs unlinked       -GpoPrefix <name>   -Server <dc>
+
+  RMM / unattended: always pass -Mode (+ -AcceptEula -Force). Any option can also be
+  set as environment variable SIEM_<OPTION> (SIEM_MODE=Verify, SIEM_FORCE=true).
+  Exit code: 0 OK, 1 needs manual completion, 2 Verify found failures.
 
 "@
 }
@@ -1361,6 +1410,11 @@ function Invoke-Main {
     $roleName = $Role
     if ($Help -or $m -eq 'Help') { Show-Help; return }
     if (-not $m) {
+        if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) {
+            # RMM / scheduled task: no one can answer the menu, so fail fast instead of hanging.
+            Write-Warn2 'No -Mode given and no interactive console. Pass -Mode (or set SIEM_MODE).'
+            Show-Help; $script:ExitCode = 1; return
+        }
         $script:Interactive = $true
         Write-Host ''
         Write-Host "SIEM Audit Policy v$PolicyVersion        H) Help   M) Manual steps   Q) Quit" -ForegroundColor White
@@ -1432,7 +1486,10 @@ function Invoke-Main {
     } else {
         $rn = Resolve-Role $roleName
         switch ($m) {
-            'Verify' { $null = Invoke-Verify $rn }
+            'Verify' {
+                $res = Invoke-Verify $rn
+                if (@($res | Where-Object { $_.Status -eq 'FAIL' }).Count -gt 0) { $script:ExitCode = 2 }
+            }
             'Show'   { Invoke-Show $rn }
             'Manual' { Show-Manual 'All' }
             'SysmonLocal' { Invoke-Step 'Sysmon on this computer' 'SysmonLocal' { Invoke-SysmonLocal } }
@@ -1455,6 +1512,7 @@ function Invoke-Main {
     Write-Host ''
     if ($script:DryRun) { Write-Ok 'Preview only - nothing was changed.' }
     if ($script:Failed.Count -gt 0) {
+        $script:ExitCode = 1
         Write-Warn2 'Needs manual completion (instructions printed above; all of them: -Mode Manual):'
         $script:Failed | ForEach-Object { Write-Warn2 "    $_" }
     } elseif (-not $script:DryRun) {
@@ -1463,4 +1521,6 @@ function Invoke-Main {
 }
 
 # Allow dot-sourcing (". .\Deploy-SiemAuditPolicy.ps1") to load functions without running.
-if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }
+# Exit code for RMM / automation: 0 OK, 1 needs manual completion, 2 Verify found failures.
+# (No exit when the text was pasted into a console - that would close the window.)
+if ($MyInvocation.InvocationName -ne '.') { Invoke-Main; if ($PSCommandPath) { exit $script:ExitCode } }

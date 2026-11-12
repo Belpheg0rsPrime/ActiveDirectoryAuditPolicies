@@ -20,7 +20,7 @@ It's one ASCII-only file with no other files to carry, so it survives copy/paste
 `-Help` prints this summary:
 
 ```
-SIEM Audit Policy v1.2.0 - run in an elevated PowerShell. No parameters = menu.
+SIEM Audit Policy v1.3.0 - run in an elevated PowerShell. No parameters = menu.
 
   .\Deploy-SiemAuditPolicy.ps1 -Mode <mode> [options]
 
@@ -32,6 +32,7 @@ SIEM Audit Policy v1.2.0 - run in an elevated PowerShell. No parameters = menu.
   This computer                                                [-Role ...]
     Local         Apply audit settings (+ remove PowerShell 2.0 engine)
     SysmonLocal   Install Sysmon now (built-in first, installer fallback)
+    LocalAll      Local + SysmonLocal (workgroup / RMM)
     Verify        Check logging, read-only
     Show          List settings, read-only
     Manual        Print manual steps for everything, no changes
@@ -45,6 +46,10 @@ SIEM Audit Policy v1.2.0 - run in an elevated PowerShell. No parameters = menu.
     -AcceptEula   Accept Sysinternals license (installer fallback)
     -WhatIf       Preview only       -Force   Answer yes to prompts
     -NoLink       Create GPOs unlinked       -GpoPrefix <name>   -Server <dc>
+
+  RMM / unattended: always pass -Mode (+ -AcceptEula -Force). Any option can also be
+  set as environment variable SIEM_<OPTION> (SIEM_MODE=Verify, SIEM_FORCE=true).
+  Exit code: 0 OK, 1 needs manual completion, 2 Verify found failures.
 ```
 
 ## Quick start (client domain onboarding)
@@ -61,7 +66,7 @@ On a **domain controller**, as a **Domain Admin**:
 3. Pick **1) Full onboarding**. To see what it would do first, pick **5) Preview** instead.
 
    ```
-   SIEM Audit Policy v1.2.0        H) Help   M) Manual steps   Q) Quit
+   SIEM Audit Policy v1.3.0        H) Help   M) Manual steps   Q) Quit
     Domain (on a DC, as Domain Admin) - you pick which computers next:
       1) Full onboarding: audit GPOs + Sysmon GPOs + AD/ADCS auditing
       2) Audit policy GPOs
@@ -96,9 +101,24 @@ Two decisions are always separate, explicit flags because they affect the client
 - `-AcceptEula` accepts the Sysinternals license, which the installer fallback needs.
 - `-SysmonExisting Overwrite` replaces the config of a Sysmon the client already runs. Unattended runs default to `Keep`.
 
-**Standalone server:** `-Mode Local` (audit settings), then `-Mode SysmonLocal`, or menu option 6 for both.
+**Standalone server:** `-Mode LocalAll` (audit settings + Sysmon), or menu option 6. `-Mode Local` and `-Mode SysmonLocal` do each half.
 
-**Other ways to run it:** paste the whole script into PowerShell ISE and press F5 to get the menu, or run it from a URL you host: `& ([scriptblock]::Create((irm https://<your-host>/Deploy-SiemAuditPolicy.ps1))) -Mode Verify`.
+**Other ways to run it:** paste the whole script into PowerShell ISE and press F5 to get the menu, or run it from a URL you host: `& ([scriptblock]::Create((irm https://<your-host>/Deploy-SiemAuditPolicy.ps1))) -Mode Verify`. Run this way, the script doesn't set an exit code.
+
+### Running from an RMM (NinjaOne, Kaseya, ...)
+
+The script never prompts when it gets a `-Mode`. Without one and without an interactive console, it prints the help and exits with 1 instead of waiting at the menu.
+
+| Job | Run on | Run as | Command |
+|---|---|---|---|
+| Onboard the domain | one DC, once per client | a Domain Admin credential | `-Mode Full -Target All -AcceptEula -Force -SysmonExisting Keep` |
+| Check the fleet | any computer, on a schedule | SYSTEM | `-Mode Verify` |
+| Workgroup / non-domain computers | each computer | SYSTEM | `-Mode LocalAll -AcceptEula -Force -SysmonExisting Keep` |
+
+- **Domain modes need a Domain Admin.** RMM agents run as SYSTEM, which on a DC acts in AD as the DC's own computer account. That account can't create GPOs or change the domain root's audit settings. Use the RMM's run-as-credential option, or have a technician run the domain modes once by hand. After that, Group Policy covers every domain computer, so the RMM doesn't need to push to them.
+- **Exit codes:** `0` OK, `1` some steps need manual completion (the output has the instructions) or the run was invoked wrongly, `2` `-Mode Verify` found failed checks. Alert on non-zero.
+- **32-bit agents:** when started in 32-bit PowerShell on 64-bit Windows, the script re-runs itself in 64-bit Windows PowerShell with the same parameters. Sysmon and `dism` don't work from 32-bit PowerShell.
+- **Parameters as environment variables:** if the RMM passes script variables as environment variables (NinjaOne does), name them `SIEM_<PARAMETER>`: `SIEM_MODE`, `SIEM_TARGET`, `SIEM_ROLE`, `SIEM_SYSMONCONFIGURL`, `SIEM_SYSMONEXISTING`, `SIEM_SYSMONZIP`, `SIEM_GPOPREFIX`, `SIEM_SERVER`. Switches take `true`/`1`/`yes`: `SIEM_ACCEPTEULA`, `SIEM_FORCE`, `SIEM_NOLINK`, `SIEM_WHATIF`. A parameter on the command line wins over the variable. `-Target` also accepts a comma list in one string, such as `Workstations,Servers`.
 
 ## Automated steps and their manual fallbacks
 
